@@ -1,0 +1,11 @@
+services:
+  discord-bot:
+    container_name: discord-bot
+    restart: no
+    environment:
+      - DISCORD_TOKEN=${DISCORD_TOKEN}
+    volumes:
+      - ./data:/data
+
+      - ./src:/app/src # ⚡ DEVELOPER MODE: Mount your source code for live updates
+    build: . # ⚡ DEVELOPER MODE: Build from local Dockerfile
