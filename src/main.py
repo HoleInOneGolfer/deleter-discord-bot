@@ -312,7 +312,7 @@ async def execute_rate_safe_purge(
         # 1. Post "Purge Started" Log
         await post_purge_log(
             guild_id,
-            build_log_embed("Purge Started", discord.Color.blue(), f"{total_target} targeted")
+            build_log_embed("Purge Started", discord.Color.blue(), f"{total_target}")
         )
 
         total_deleted = 0
