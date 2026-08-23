@@ -209,9 +209,7 @@ class SettingsManager:
 
 async def post_purge_log(guild_id: int, embed: discord.Embed) -> discord.Message | None:
     """
-    Posts an embed to the guild's configured log channel, if one is set, and
-    returns the sent message so it can later be edited in place (for
-    progress updates / the final result) instead of spamming new messages.
+    Posts a new embed message to the guild's configured log channel, if one is set.
     Returns None (and no-ops, aside from a console log) if none is
     configured or the channel can't be resolved/posted to, so a missing or
     broken log channel never breaks the actual purge job.
@@ -233,16 +231,6 @@ async def post_purge_log(guild_id: int, embed: discord.Embed) -> discord.Message
     except discord.HTTPException as e:
         logger.warning(f"Failed to post to log channel {log_channel_id} for guild {guild_id}: {e}")
         return None
-
-
-async def edit_purge_log(log_message: discord.Message | None, embed: discord.Embed):
-    """Edits a previously-posted log message in place. No-ops if there isn't one."""
-    if log_message is None:
-        return
-    try:
-        await log_message.edit(embed=embed)
-    except discord.HTTPException as e:
-        logger.warning(f"Failed to edit log message {log_message.id}: {e}")
 
 
 async def execute_rate_safe_purge(
@@ -309,49 +297,36 @@ async def execute_rate_safe_purge(
 
         await _status(f"Found **{total_target}** target message(s) in {channel.mention}. Starting deletion...")
 
-        def build_log_embed(status: str, color: discord.Color, deleted_so_far: int) -> discord.Embed:
+        def build_log_embed(title: str, color: discord.Color, count_value: str) -> discord.Embed:
             embed = discord.Embed(
-                title=status,
+                title=title,
                 description=f"Purge in {channel.mention}, requested by {requested_by}",
                 color=color,
                 timestamp=datetime.now(timezone.utc)
             )
             embed.add_field(name="Age rule", value=f"> {max_age_days} day(s)")
             embed.add_field(name="Limit", value=str(limit) if limit is not None else "None")
-            # Deleted-so-far is folded into this field (rather than being its
-            # own field) so all three stay in a single row — Discord wraps
-            # inline embed fields onto a new line after every 3.
-            embed.add_field(name="Target message(s)", value=f"{deleted_so_far} / {total_target} deleted")
+            embed.add_field(name="Messages", value=count_value)
             return embed
 
-        log_message = await post_purge_log(
+        # 1. Post "Purge Started" Log
+        await post_purge_log(
             guild_id,
-            build_log_embed("Purge Started", discord.Color.blue(), deleted_so_far=0)
+            build_log_embed("Purge Started", discord.Color.blue(), f"{total_target} targeted")
         )
 
         total_deleted = 0
-
-        # 1. Execute Bulk Deletion (<14 days old)
-        # Deletes by message ID directly rather than re-scanning history with
-        # purge()+check, which only inspects the N most recent channel
-        # messages and would miss candidates further back.
-        # A single chunk can't be interrupted mid-request, but with many
-        # chunks the whole phase can take a while, so it's checked between
-        # chunks via stop_event.
         stopped_early = False
+
+        # 2. Execute Bulk Deletion (<14 days old)
         if bulk_candidates:
             deleted_bulk_count, stopped_early = await bulk_delete_in_chunks(channel, bulk_candidates, stop_event)
             total_deleted += deleted_bulk_count
             logger.info(f"Bulk delete finished. Removed {deleted_bulk_count} message(s). (stopped_early={stopped_early})")
-            if stopped_early:
-                logger.info("Stop requested during bulk delete phase. Skipping individual delete phase.")
-            elif individual_candidates:
+            if not stopped_early and individual_candidates:
                 await _status(f"Removed {deleted_bulk_count} newer message(s). Now working through **{len(individual_candidates)}** older message(s) (paced, ~1/sec)...")
-                await edit_purge_log(log_message, build_log_embed(
-                    "Purge In Progress", discord.Color.blue(), deleted_so_far=total_deleted
-                ))
 
-        # 2. Execute Rate-Safe Individual Deletion (>=14 days old)
+        # 3. Execute Rate-Safe Individual Deletion (>=14 days old)
         if individual_candidates and not stopped_early:
             total_ind = len(individual_candidates)
             logger.info(f"Starting individual deletion sequence for {total_ind} message(s) >=14 days old...")
@@ -360,33 +335,33 @@ async def execute_rate_safe_purge(
             for idx, msg in enumerate(individual_candidates, start=1):
                 if stop_event.is_set():
                     stopped_early = True
-                    logger.info(f"Stop requested. Halting after {idx - 1}/{total_ind} individual deletions.")
+                    logger.info(f"Stop requested before msg {idx}/{total_ind}. Halting.")
                     break
 
                 async with GLOBAL_DELETE_SEMAPHORE:
                     success = False
                     while not success:
+                        # Fast check before initiating an HTTP request
+                        if stop_event.is_set():
+                            stopped_early = True
+                            break
+
                         try:
                             await msg.delete()
                             total_deleted += 1
                             success = True
                             logger.info(f"[{idx}/{total_ind}] Deleted MSG {msg.id} ({msg.created_at.strftime('%Y-%m-%d')})")
 
-                            # Throttled progress update so the user isn't
-                            # staring at a stale "Scanning..." message for
-                            # the whole paced deletion run. Same throttle
-                            # covers both the interaction reply and the log.
+                            # Throttled status updates for user interaction
                             if time.monotonic() - last_progress_update >= 4.0:
                                 last_progress_update = time.monotonic()
                                 await _status(f"Deleting older messages in {channel.mention}... **{idx}/{total_ind}** removed so far.")
-                                await edit_purge_log(log_message, build_log_embed(
-                                    "Purge In Progress", discord.Color.blue(), deleted_so_far=total_deleted
-                                ))
 
-                            # Interruptible: wakes immediately if /stop fires,
-                            # instead of always waiting out the full delay.
+                            # Interruptible sleep: halts instantly if stop signal fires
                             if await interruptible_sleep(INDIVIDUAL_DELETE_DELAY, stop_event):
                                 stopped_early = True
+                                break
+
                         except discord.NotFound:
                             logger.warning(f"[{idx}/{total_ind}] MSG {msg.id} was already removed.")
                             success = True
@@ -394,9 +369,10 @@ async def execute_rate_safe_purge(
                             if e.status == 429:  # Rate Limit
                                 retry_after = getattr(e, 'retry_after', 5.0)
                                 logger.warning(f"Rate limited (429)! Backing off for {retry_after:.2f}s...")
+                                # Halt immediately if /stop is called while waiting on rate-limit cooldowns
                                 if await interruptible_sleep(retry_after + 0.5, stop_event):
                                     stopped_early = True
-                                    success = True  # stop the retry loop; message stays undeleted
+                                    break
                             else:
                                 logger.error(f"Failed to delete MSG {msg.id}: {e}")
                                 success = True
@@ -405,19 +381,23 @@ async def execute_rate_safe_purge(
                     logger.info(f"Stop requested. Halting after {idx}/{total_ind} individual deletions.")
                     break
 
+        # 4. Post Final State Log (Stopped or Finished)
         if stopped_early:
             await _status(f"Purge stopped early. Removed **{total_deleted}** message(s) in {channel.mention} before cancellation.")
+            await post_purge_log(
+                guild_id,
+                build_log_embed("Purge Stopped Early", discord.Color.orange(), f"{total_deleted} / {total_target} deleted")
+            )
         else:
             await _status(f"Purge complete! Successfully removed **{total_deleted}** message(s) older than {max_age_days} day(s) in {channel.mention}.")
+            await post_purge_log(
+                guild_id,
+                build_log_embed("Purge Completed", discord.Color.green(), f"{total_deleted} / {total_target} deleted")
+            )
+
         logger.info(f"Finished purge job in #{channel.name}. Total deleted: {total_deleted} (stopped_early={stopped_early})")
-
-        await edit_purge_log(log_message, build_log_embed(
-            "Purge Stopped Early" if stopped_early else "Purge Completed",
-            discord.Color.orange() if stopped_early else discord.Color.green(),
-            deleted_so_far=total_deleted
-        ))
-
         return total_deleted
+
     finally:
         ACTIVE_PURGE_STOP_EVENTS.pop(channel.id, None)
 
@@ -514,7 +494,6 @@ async def purge_count(interaction: discord.Interaction, channel: discord.TextCha
         limit=amount,
         status_update=lambda content: interaction.edit_original_response(content=content)
     )
-
 
 
 # Command 4: Dry Run / Preview Messages
